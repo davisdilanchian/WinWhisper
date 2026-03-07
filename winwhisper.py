@@ -110,8 +110,12 @@ class WinWhisper:
             audio,
             language=LANGUAGE,
             fp16=(DEVICE == "cuda"),
+            condition_on_previous_text=False,
+            compression_ratio_threshold=None,
+            no_speech_threshold=0.45,
         )
-        text = result["text"].strip()
+        # Join all segments to avoid truncation
+        text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
         print(f"Transcribed: {text}")
 
         self.tray.set_transcribing(False)
