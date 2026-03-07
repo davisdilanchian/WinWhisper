@@ -1,0 +1,9 @@
+openai-whisper
+torch
+sounddevice
+pystray
+pynput
+pyperclip
+pyautogui
+Pillow
+numpy
