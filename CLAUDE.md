@@ -38,6 +38,18 @@ Building a local Whisper-based dictation tool for Windows that replaces the nati
 - 2026-06-02: Fixed pythonw crash -> under pythonw (the .vbs launcher) sys.stdout is None,
   so the first print() crashed the app. _setup_logging() now redirects stdout/stderr to
   winwhisper.log when there's no console. This is also the app's log file.
+- 2026-06-02: MIC FIX (was capturing silence!) -> Windows feeds apps pure silence on the
+  default MME/DirectSound path for the user's USB interface (Shure); only the WDM-KS path
+  carries real audio. INPUT_DEVICE="USB Audio CODEC" + _resolve_input_device() prefers the
+  WDM-KS host API. Without this, every transcription came back empty.
+- 2026-06-02: LONG-FORM mode (now the shipping default) -> for dictating continuously. Every
+  FLUSH_INTERVAL it transcribes captured audio, emits finished text, and trims it (memory
+  stays flat, never lose more than the buffer). Cuts ONLY at detected silence
+  (_find_silence_cut: >=MIN_SILENCE_MS below SILENCE_RMS, never within last TAIL_KEEP_MS) so
+  words are never split. FLUSH_MAX_BUFFER is just a no-pause hard cap.
+- 2026-06-02: On-screen recording indicator (overlay.py) -> frameless top-center banner,
+  blinking red "Recording" / blue "Transcribing", WS_EX_NOACTIVATE so it never steals focus
+  (critical: otherwise dictated text would land in the banner). Tray icon was too easy to miss.
 
 ## GOTCHAS (read before debugging "it won't run" / "behaves like an old version")
 - Microsoft Store Python: the process is named **python3.11.exe / pythonw3.11.exe**, NOT
@@ -52,12 +64,12 @@ Building a local Whisper-based dictation tool for Windows that replaces the nati
   live-debug visibility.
 
 ## Next steps
-- DECISION 2026-06-02: User chose instant batch over streaming (streaming always lags batch
-  because openai-whisper pads every clip to 30s, so each pass is ~full cost). Shipping config:
-  STREAMING=False, OUTPUT_MODE="paste". Streaming code retained but off.
-- If we ever want fast live streaming: switch to faster-whisper (CTranslate2) + transcribe
-  only the unconfirmed tail instead of the whole growing buffer.
-- Commit + push to GitHub (davisdilanchian/WinWhisper).
+- SHIPPING CONFIG 2026-06-02: LONG_FORM=True, OUTPUT_MODE="paste", INPUT_DEVICE="USB Audio
+  CODEC". FLUSH_INTERVAL=0.8, MIN_SILENCE_MS=320, SILENCE_RMS=0.012, FLUSH_MAX_BUFFER=18.
+  STREAMING code retained but off (LONG_FORM takes priority).
+- Tuning if user reports issues: laggy in quiet room -> lower MIN_SILENCE_MS; cuts on micro-
+  pauses -> raise it; noisy room never flushes -> raise SILENCE_RMS.
+- If we ever want fast word-by-word live: switch to faster-whisper (CTranslate2).
 
 ## Future goals
 - Configurable hotkey via tray menu

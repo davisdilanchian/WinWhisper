@@ -19,9 +19,36 @@ import whisper
 
 from config import (
     MODEL_SIZE, SAMPLE_RATE, CHANNELS, DEVICE, LANGUAGE,
-    OUTPUT_MODE, TYPE_CHAR_DELAY, STREAMING, STREAM_INTERVAL,
+    OUTPUT_MODE, TYPE_CHAR_DELAY, STREAMING, STREAM_INTERVAL, INPUT_DEVICE,
+    LONG_FORM, FLUSH_INTERVAL, FLUSH_MAX_BUFFER,
+    SILENCE_RMS, MIN_SILENCE_MS, TAIL_KEEP_MS,
 )
 from tray import TrayIcon
+from overlay import RecordingOverlay
+
+
+def _resolve_input_device(spec):
+    """Resolve INPUT_DEVICE (None / int index / name substring) to a device
+    index. Returns None (Windows default) if it can't be matched.
+
+    When matching by name, prefer the WDM-KS host API: on this machine the
+    USB interface delivers pure silence through MME/DirectSound but real audio
+    through the raw WDM-KS driver path, so we pick that when available."""
+    if spec is None or isinstance(spec, int):
+        return spec
+    spec_l = str(spec).lower()
+    matches = []
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0 and spec_l in d["name"].lower():
+            api = sd.query_hostapis(d["hostapi"])["name"]
+            matches.append((i, api))
+    if not matches:
+        print(f"Input device matching '{spec}' not found; using system default.")
+        return None
+    for i, api in matches:
+        if "WDM-KS" in api:
+            return i
+    return matches[0][0]
 
 # pyautogui's fail-safe (mouse to a screen corner) raises mid-paste and would
 # kill the transcribe thread. A dictation tool shouldn't be hostage to cursor
@@ -155,6 +182,7 @@ class WinWhisper:
         self.stream = None
         self.model = None
         self.tray = TrayIcon(on_quit=self.quit)
+        self.overlay = RecordingOverlay()
         self.running = True
         self.hook = None
         self._hook_proc_ref = None       # prevent GC of the ctypes callback
@@ -166,6 +194,23 @@ class WinWhisper:
         self._prev_words = []            # previous pass's hypothesis
         self._committed = 0              # number of words already typed
         self._typed_any = False          # whether we've emitted the first word
+        # Long-form state
+        self._pending = None             # un-emitted audio (np.float32), trimmed as we go
+        self._emitted_any = False        # whether any chunk has been emitted this utterance
+        self._input_device = _resolve_input_device(INPUT_DEVICE)
+
+    def _set_status(self, state):
+        """Drive both the tray icon and the on-screen overlay together.
+        state: 'idle' | 'rec' | 'busy'."""
+        if state == "rec":
+            self.tray.set_recording(True)
+            self.overlay.set_recording(True)
+        elif state == "busy":
+            self.tray.set_transcribing(True)
+            self.overlay.set_transcribing(True)
+        else:
+            self.tray.set_recording(False)
+            self.overlay.set_recording(False)
 
     # ------------------------------------------------------------------
     # Model + audio
@@ -189,11 +234,13 @@ class WinWhisper:
                 return
             self.recording = True
             self.audio_data = []
-        # Reset streaming/commit state for this utterance.
+        # Reset streaming/long-form/commit state for this utterance.
         self._prev_words = []
         self._committed = 0
         self._typed_any = False
-        self.tray.set_recording(True)
+        self._pending = None
+        self._emitted_any = False
+        self._set_status("rec")
         print("Recording...")
 
         def callback(indata, frames, time_info, status):
@@ -204,11 +251,15 @@ class WinWhisper:
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype="float32",
+            device=self._input_device,
             callback=callback,
         )
         self.stream.start()
 
-        if STREAMING:
+        if LONG_FORM:
+            self._stream_thread = threading.Thread(target=self._longform_loop, daemon=True)
+            self._stream_thread.start()
+        elif STREAMING:
             self._stream_thread = threading.Thread(target=self._stream_loop, daemon=True)
             self._stream_thread.start()
 
@@ -223,22 +274,22 @@ class WinWhisper:
             self.stream = None
         print("Recording stopped.")
 
-        if not self.audio_data:
-            self.tray.set_recording(False)
+        if not self.audio_data and self._pending is None:
+            self._set_status("idle")
             print("No audio captured.")
             return
 
         # Blue (transcribing) until the final pass finishes.
-        self.tray.set_transcribing(True)
-        if STREAMING:
-            # The stream loop sees recording=False, does a final flush, and
-            # clears the transcribing state itself. Nothing more to do here.
+        self._set_status("busy")
+        if LONG_FORM or STREAMING:
+            # The worker loop sees recording=False, does a final flush, and
+            # clears the status itself. Nothing more to do here.
             pass
         else:
             threading.Thread(target=self._transcribe, daemon=True).start()
 
     def _transcribe(self):
-        self.tray.set_transcribing(True)
+        self._set_status("busy")
         print("Transcribing...")
         try:
             audio = np.concatenate(self.audio_data, axis=0).flatten()
@@ -257,10 +308,125 @@ class WinWhisper:
             print(f"Transcription failed: {e}")
             text = ""
         finally:
-            self.tray.set_transcribing(False)
+            self._set_status("idle")
 
         if text:
             self._type_text(text)
+
+    # ------------------------------------------------------------------
+    # Long-form mode: flush completed sentences every few seconds, trim audio
+    # ------------------------------------------------------------------
+    def _longform_loop(self):
+        """Every FLUSH_INTERVAL, transcribe captured audio, emit completed
+        sentences, and discard that audio. On stop, flush whatever remains."""
+        elapsed = 0.0
+        while self.recording:
+            time.sleep(0.1)
+            elapsed += 0.1
+            if elapsed >= FLUSH_INTERVAL:
+                elapsed = 0.0
+                self._longform_flush(final=False)
+        try:
+            self._longform_flush(final=True)
+        finally:
+            self._set_status("idle")
+            print("Done.")
+
+    def _transcribe_text(self, audio):
+        """Transcribe an audio buffer and return the joined text."""
+        result = self.model.transcribe(
+            audio,
+            language=LANGUAGE,
+            fp16=(DEVICE == "cuda"),
+            condition_on_previous_text=False,
+            compression_ratio_threshold=None,
+            no_speech_threshold=0.45,
+        )
+        return " ".join(s["text"].strip() for s in result.get("segments", [])).strip()
+
+    def _find_silence_cut(self, audio):
+        """Return a sample index at a pause (silence) where it's safe to cut
+        without splitting a word, or None if no pause has occurred yet. Picks the
+        LATEST qualifying pause (so we emit as much as possible), but never within
+        the most recent TAIL_KEEP_MS (you might still be mid-word)."""
+        sr = SAMPLE_RATE
+        frame = int(0.02 * sr)  # 20 ms analysis frames
+        n = audio.size // frame
+        if n < 5:
+            return None
+        frames = audio[:n * frame].reshape(n, frame).astype(np.float64)
+        rms = np.sqrt((frames ** 2).mean(axis=1))
+        silent = rms < SILENCE_RMS
+        min_sil = max(1, int((MIN_SILENCE_MS / 1000.0) * sr / frame))
+        tail = int((TAIL_KEEP_MS / 1000.0) * sr / frame)
+        best = None
+        i = 0
+        while i < n:
+            if silent[i]:
+                j = i
+                while j < n and silent[j]:
+                    j += 1
+                if (j - i) >= min_sil and j <= n - tail:
+                    best = (i, j)  # keep scanning for the latest one
+                i = j
+            else:
+                i += 1
+        if best is None:
+            return None
+        i, j = best
+        return ((i + j) // 2) * frame  # cut in the middle of the pause
+
+    def _longform_flush(self, final):
+        # Pull any newly recorded audio into the pending buffer.
+        with self._lock:
+            chunks = self.audio_data
+            self.audio_data = []
+        if chunks:
+            new = np.concatenate(chunks, axis=0).flatten()
+            self._pending = new if self._pending is None else np.concatenate([self._pending, new])
+
+        if self._pending is None or self._pending.size == 0:
+            return
+        dur = self._pending.size / SAMPLE_RATE
+
+        if final:
+            if dur >= 0.2:
+                self._emit_chunk(self._transcribe_text(self._pending))
+            self._pending = None
+            return
+
+        # Cut only at a real pause so we never split a word.
+        cut = self._find_silence_cut(self._pending)
+        if cut is None:
+            # No pause yet. Only as a last resort (you've talked non-stop for a
+            # very long time) cut at the quietest recent point to bound memory.
+            if dur < FLUSH_MAX_BUFFER:
+                return
+            tail = int((TAIL_KEEP_MS / 1000.0) * SAMPLE_RATE)
+            region = self._pending[:max(1, self._pending.size - tail)]
+            cut = int(np.argmin(np.abs(region)))
+            if cut < SAMPLE_RATE // 2:
+                return  # nothing meaningful to emit yet
+
+        head = self._pending[:cut]
+        self._pending = self._pending[cut:]
+        if head.size / SAMPLE_RATE >= 0.2:
+            text = self._transcribe_text(head)
+            if text:
+                self._emit_chunk(text)
+
+    def _emit_chunk(self, text):
+        """Emit one chunk of finalized text, with a separating space."""
+        text = text.strip()
+        if not text:
+            return
+        out = text if not self._emitted_any else " " + text
+        self._emitted_any = True
+        print(f"  >> {text}", flush=True)
+        if OUTPUT_MODE == "type":
+            self._type_out(out)
+        else:
+            self._paste_text(out)
 
     # ------------------------------------------------------------------
     # Live streaming (LocalAgreement-2)
@@ -292,7 +458,7 @@ class WinWhisper:
         try:
             self._stream_pass(final=True)
         finally:
-            self.tray.set_transcribing(False)
+            self._set_status("idle")
             print("Done.")
 
     def _stream_pass(self, final):
@@ -474,9 +640,15 @@ class WinWhisper:
 
     def run(self):
         print("WinWhisper starting...")
+        if self._input_device is not None:
+            print(f"Input device: [{self._input_device}] "
+                  f"{sd.query_devices(self._input_device)['name']}")
+        else:
+            print("Input device: Windows default")
         self.load_model()
         self._install_hook()
 
+        self.overlay.start()
         threading.Thread(target=self._control_loop, daemon=True).start()
         threading.Thread(target=self.tray.run, daemon=True).start()
 
